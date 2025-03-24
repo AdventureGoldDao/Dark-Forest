@@ -1,0 +1,826 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.0;
+
+// External contract imports
+import {DFArtifactFacet} from "../facets/DFArtifactFacet.sol";
+
+// Library imports
+import {LibGameUtils} from "./LibGameUtils.sol";
+
+// Storage imports
+import {LibStorage, GameStorage, LogStorage, GameConstants} from "./LibStorage.sol";
+
+// Type imports
+import {Biome, Planet, PlanetType, Artifact, ArtifactType, ArtifactRarity, DFPFindArtifactArgs, DFTCreateArtifactArgs} from "../DFTypes.sol";
+
+library LibArtifactUtils {
+    function gs() internal pure returns (GameStorage storage) {
+        return LibStorage.gameStorage();
+    }
+
+    function ls() internal pure returns (LogStorage storage) {
+        return LibStorage.analysisStorage();
+    }
+
+    function gameConstants() internal pure returns (GameConstants storage) {
+        return LibStorage.gameConstants();
+    }
+
+    // also need to copy some of DFCore's event signatures
+    event ArtifactActivated(address player, uint256 artifactId, uint256 loc, uint256 linkTo);
+    event ArtifactDeactivated(address player, uint256 artifactId, uint256 loc, uint256 linkTo);
+    event PlanetUpgraded(address player, uint256 loc, uint256 branch, uint256 toBranchLevel);
+
+    // verifies that user is allowed to call findArtifact on this planet
+    function checkFindArtifact(uint256 locationId, Planet memory planet)
+        public
+        view
+        returns (bool)
+    {
+        require(!planet.hasTriedFindingArtifact, "artifact already minted from this planet");
+        require(planet.owner == msg.sender, "you can only find artifacts on planets you own");
+        require(planet.prospectedBlockNumber != 0, "planet never prospected");
+        require(
+            planet.prospectedBlockNumber < block.number,
+            "can only call findArtifact after prospectedBlockNumber"
+        );
+        require(block.number > planet.prospectedBlockNumber, "invalid prospectedBlockNumber");
+        require(block.number - planet.prospectedBlockNumber < 256, "planet prospect expired");
+        require(!planet.destroyed, "planet is destroyed");
+        require(!planet.frozen, "planet is frozen");
+        if (gameConstants().SPACESHIPS.GEAR) {
+            require(containsGear(locationId), "gear ship must be present on planet");
+        }
+
+        return true;
+    }
+
+    /**
+     * Create a new spaceship and place it on a planet owned by the given player. Returns the id
+     * of the newly created spaceship.
+     */
+    function createAndPlaceSpaceship(
+        uint256 planetId,
+        address owner,
+        ArtifactType shipType
+    ) public returns (uint256) {
+        require(shipType <= ArtifactType.ShipPink && shipType >= ArtifactType.ShipMothership);
+
+        uint256 id = uint256(keccak256(abi.encodePacked(planetId, gs().miscNonce++)));
+
+        DFTCreateArtifactArgs memory createArtifactArgs = DFTCreateArtifactArgs(
+            id,
+            msg.sender,
+            planetId,
+            ArtifactRarity.Unknown,
+            Biome.Unknown,
+            shipType,
+            address(this),
+            owner,
+            0
+        );
+
+        Artifact memory foundArtifact = DFArtifactFacet(address(this)).createArtifact(
+            createArtifactArgs
+        );
+        LibGameUtils._putArtifactOnPlanet(foundArtifact.id, planetId);
+
+        return id;
+    }
+
+    function findArtifact(DFPFindArtifactArgs memory args) public returns (uint256 artifactId) {
+        Planet storage planet = gs().planets[args.planetId];
+
+        require(checkFindArtifact(args.planetId, planet));
+
+        Biome biome = LibGameUtils._getBiome(planet.spaceType, args.biomebase);
+
+        uint256 artifactSeed = uint256(
+            keccak256(
+                abi.encodePacked(
+                    args.planetId,
+                    args.coreAddress,
+                    blockhash(planet.prospectedBlockNumber)
+                )
+            )
+        );
+
+        (
+            ArtifactType artifactType,
+            uint256 levelBonus,
+            ArtifactRarity artifactRarity
+        ) = LibGameUtils._randomArtifactTypeAndLevelBonus(
+                artifactSeed,
+                biome,
+                planet.spaceType,
+                planet.planetLevel
+            );
+
+        DFTCreateArtifactArgs memory createArtifactArgs = DFTCreateArtifactArgs(
+            artifactSeed,
+            msg.sender,
+            args.planetId,
+            artifactRarity,
+            biome,
+            artifactType,
+            args.coreAddress,
+            address(0),
+            0
+        );
+
+        Artifact memory foundArtifact = DFArtifactFacet(address(this)).createArtifact(
+            createArtifactArgs
+        );
+
+        if (foundArtifact.rarity == ArtifactRarity.Mythic) {
+            if (ls().firstMythicArtifactOwner == address(0))
+                ls().firstMythicArtifactOwner = msg.sender;
+        }
+        LibGameUtils._putArtifactOnPlanet(foundArtifact.id, args.planetId);
+
+        planet.hasTriedFindingArtifact = true;
+        gs().players[msg.sender].score += gameConstants().ARTIFACT_POINT_VALUES[
+            uint256(foundArtifact.rarity)
+        ];
+
+        artifactId = foundArtifact.id;
+    }
+
+    function activateArtifact(
+        uint256 locationId,
+        uint256 artifactId,
+        uint256 linkTo
+    ) public {
+        Planet storage planet = gs().planets[locationId];
+        Artifact storage artifact = gs().artifacts[artifactId];
+
+        require(
+            LibGameUtils.isArtifactOnPlanet(locationId, artifactId),
+            "can't active an artifact on a planet it's not on"
+        );
+
+        if (isSpaceship(artifact.artifactType)) {
+            activateSpaceshipArtifact(locationId, artifactId, planet, artifact);
+        } else {
+            activateNonSpaceshipArtifact(locationId, artifactId, linkTo, planet, artifact);
+        }
+
+        artifact.activations++;
+    }
+
+    function activateSpaceshipArtifact(
+        uint256 locationId,
+        uint256 artifactId,
+        Planet storage planet,
+        Artifact storage artifact
+    ) private {
+        if (artifact.artifactType == ArtifactType.ShipCrescent) {
+            require(artifact.activations == 0, "crescent cannot be activated more than once");
+
+            require(
+                planet.planetType != PlanetType.SILVER_MINE,
+                "cannot turn a silver mine into a silver mine"
+            );
+
+            require(planet.owner == address(0), "can only activate crescent on unowned planets");
+            require(planet.planetLevel >= 1, "planet level must be more than one");
+
+            artifact.lastActivated = block.timestamp;
+            artifact.lastDeactivated = block.timestamp;
+
+            if (planet.silver == 0) {
+                planet.silver = 1;
+                Planet memory defaultPlanet = LibGameUtils._defaultPlanet(
+                    locationId,
+                    planet.planetLevel,
+                    PlanetType.SILVER_MINE,
+                    planet.spaceType,
+                    gameConstants().TIME_FACTOR_HUNDREDTHS
+                );
+
+                planet.silverGrowth = defaultPlanet.silverGrowth;
+            }
+
+            planet.planetType = PlanetType.SILVER_MINE;
+            emit ArtifactActivated(msg.sender, artifactId, locationId, 0);
+        }
+    }
+
+    function activateNonSpaceshipArtifact(
+        uint256 locationId,
+        uint256 artifactId,
+        uint256 linkTo,
+        Planet storage planet,
+        Artifact memory artifact
+    ) private {
+        require(locationId != linkTo, "locationId ne linkTo");
+        require(
+            planet.owner == msg.sender,
+            "you must own the planet you are activating an artifact on"
+        );
+        require(
+            !LibGameUtils.getActiveArtifact(locationId).isInitialized,
+            "there is already an active artifact on this planet"
+        );
+        require(!planet.destroyed, "planet is destroyed");
+        require(!planet.frozen, "planet is frozen");
+
+        require(artifact.isInitialized, "this artifact is not on this planet");
+        gs().players[msg.sender].activateArtifactAmount++;
+
+        // if (artifact.artifactType != ArtifactType.Avatar) {
+        //     uint256 totalAmount = gs().players[msg.sender].activateArtifactAmount + 1;
+        //     uint256 totalGameBlocks = block.number - gameConstants().GAME_START_BLOCK;
+
+        //     //NOTE: redstone 2 sec for 1 block
+        //     //1 hour 1 artifact
+        //     //require(totalGameBlocks * 2 >= amount * 60 * 60, "block number limit");
+
+        //     //myTodo: 2 min 1 artifact
+        //     uint256 deltaTime = 2;
+        //     require(totalGameBlocks * 2 >= totalAmount * 60 * deltaTime, "block number limit");
+        //     gs().players[msg.sender].activateArtifactAmount++;
+        // }
+
+        // round 2: activate artifact cooldown
+        // require(
+        //     block.timestamp - gs().lastActivateArtifactTimestamp[msg.sender] >
+        //         gameConstants().ACTIVATE_ARTIFACT_COOLDOWN,
+        //     "wait for cooldown before activating artifact again"
+        // );
+
+        gs().lastActivateArtifactTimestamp[msg.sender] = block.timestamp;
+        // bool nonAvatarArtifactCanActivateWithAvatarActivated = LibGameUtils.getActiveArtifact(locationId).artifactType == ArtifactType.Avatar && artifact.artifactType != ArtifactType.Avatar;
+
+        // Unknown is the 0th one, Monolith is the 1st, and so on.
+        // TODO v0.6: consider photoid canon
+
+        uint256[17] memory artifactCooldownsHours = [
+            uint256(24),
+            0,
+            0,
+            0,
+            0,
+            4,
+            4,
+            24,
+            24,
+            24,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ];
+
+        require(
+            artifact.lastDeactivated +
+                artifactCooldownsHours[uint256(artifact.artifactType)] *
+                60 *
+                60 <
+                block.timestamp,
+            "this artifact is on a cooldown"
+        );
+
+        bool shouldDeactivateAndBurn = false;
+
+        artifact.lastActivated = block.timestamp;
+        emit ArtifactActivated(msg.sender, artifactId, locationId, linkTo);
+
+        if (artifact.artifactType == ArtifactType.Wormhole) {
+            require(linkTo != 0, "you must provide a linkTo to activate a wormhole");
+            require(
+                gs().planets[linkTo].owner == msg.sender,
+                "you can only create a wormhole to a planet you own"
+            );
+            require(!gs().planets[linkTo].destroyed, "planet destroyed");
+            require(!gs().planets[linkTo].frozen, "planet frozen");
+
+            //round 4 remove the rarity limit
+            // require(
+            //     2 * uint256(artifact.rarity) >= planet.planetLevel,
+            //     "artifact is not powerful enough to apply effect to this planet level"
+            // );
+            // require(
+            //     2 * uint256(artifact.rarity) >= gs().planets[linkTo].planetLevel,
+            //     "artifact is not powerful enough to apply effect to this planet level"
+            // );
+
+            artifact.linkTo = linkTo;
+        } else if (artifact.artifactType == ArtifactType.PlanetaryShield) {
+            //NOTE: round 4 remove the rarity limit to PlanetaryShield
+            // require(
+            //     2 * uint256(artifact.rarity) >= planet.planetLevel,
+            //     "artifact is not powerful enough to apply effect to this planet level"
+            // );
+        } else if (artifact.artifactType == ArtifactType.PhotoidCannon) {
+            //NOTE: round 4 remove the rarity limit to Photoid Cannon
+            // require(
+            //     2 * uint256(artifact.rarity) >= planet.planetLevel,
+            //     "artifact is not powerful enough to apply effect to this planet level"
+            // );
+        } else if (artifact.artifactType == ArtifactType.BloomFilter) {
+            require(
+                2 * uint256(artifact.rarity) >= planet.planetLevel,
+                "artifact is not powerful enough to apply effect to this planet level"
+            );
+            planet.population = planet.populationCap;
+            // planet.silver = planet.silverCap;
+            shouldDeactivateAndBurn = true;
+        } else if (artifact.artifactType == ArtifactType.BlackDomain) {
+            require(
+                2 * uint256(artifact.rarity) >= planet.planetLevel,
+                "artifact is not powerful enough to apply effect to this planet level"
+            );
+            planet.destroyed = true;
+            shouldDeactivateAndBurn = true;
+
+            // NOTE: we change the effect of BlockDomain in round 1
+            // require(linkTo != 0, "you must provide a linkTo to activate a BlockDomain");
+            // Planet storage toPlanet = gs().planets[linkTo];
+
+            // require(
+            //     toPlanet.owner != address(0),
+            //     "you can only create a BlockDomain link to a planet has owner"
+            // );
+
+            // require(!toPlanet.adminProtect, "planet adminProtect");
+            // require(!toPlanet.destroyed, "planet destroyed");
+            // require(!toPlanet.frozen, "planet frozen");
+            // require(
+            //     planet.planetLevel >= toPlanet.planetLevel,
+            //     "fromPlanetLevel must be >= toPlanetLevel"
+            // );
+
+            // require(
+            //     2 * uint256(artifact.rarity) >= planet.planetLevel,
+            //     "artifact is not powerful enough to apply effect to this planet level"
+            // );
+
+            // Artifact memory artifactOnToPlanet = LibGameUtils.getActiveArtifact(linkTo);
+            // if (artifactOnToPlanet.artifactType == ArtifactType.PlanetaryShield) {
+            //     require(
+            //         artifact.rarity > artifactOnToPlanet.rarity,
+            //         "BlockDomain rarity must be higher"
+            //     );
+            // }
+            // toPlanet.destroyed = true;
+            // shouldDeactivateAndBurn = true;
+        } else if (artifact.artifactType == ArtifactType.IceLink) {
+            require(linkTo != 0, "you must provide a linkTo to activate a IceLink");
+            Planet storage toPlanet = gs().planets[linkTo];
+
+            require(
+                toPlanet.owner != msg.sender && toPlanet.owner != address(0),
+                "you can only create a icelink to a planet other own"
+            );
+
+            // require(!toPlanet.adminProtect, "planet adminProtect");
+            require(!toPlanet.destroyed, "planet destroyed");
+            require(!toPlanet.frozen, "planet frozen");
+            require(
+                planet.planetLevel >= toPlanet.planetLevel,
+                "fromPlanetLevel must be >= toPlanetLevel"
+            );
+
+            require(
+                2 * uint256(artifact.rarity) >= planet.planetLevel,
+                "artifact is not powerful enough to apply effect to this planet level"
+            );
+
+            // Artifact memory artifactOnToPlanet = LibGameUtils.getActiveArtifact(linkTo);
+            // if (artifactOnToPlanet.artifactType == ArtifactType.PlanetaryShield) {
+            //     require(
+            //         artifact.rarity > artifactOnToPlanet.rarity,
+            //         "Ice Link rarity must be higher"
+            //     );
+            // }
+
+            planet.frozen = true;
+            gs().planets[linkTo].frozen = true;
+            artifact.linkTo = linkTo;
+        } else if (artifact.artifactType == ArtifactType.FireLink) {
+            require(linkTo != 0, "you must provide a linkTo to activate a FireLink");
+            Planet storage toPlanet = gs().planets[linkTo];
+            if (toPlanet.destroyed) {
+                require(
+                    planet.planetLevel >= toPlanet.planetLevel,
+                    "fromPlanetLevel need gte toPlanetLevel"
+                );
+
+                require(
+                    2 * uint256(artifact.rarity) >= planet.planetLevel,
+                    "artifact is not powerful enough to apply effect to this planet level"
+                );
+
+                shouldDeactivateAndBurn = true;
+
+                toPlanet.destroyed = false;
+            } else {
+                // require(!toPlanet.destroyed, "planet destroyed");
+
+                require(toPlanet.frozen, "toPlanet must be frozen");
+                require(
+                    planet.planetLevel >= toPlanet.planetLevel,
+                    "fromPlanetLevel need gte toPlanetLevel"
+                );
+
+                require(
+                    2 * uint256(artifact.rarity) >= planet.planetLevel,
+                    "artifact is not powerful enough to apply effect to this planet level"
+                );
+
+                Artifact memory activeArtifactOnToPlanet = LibGameUtils.getActiveArtifact(linkTo);
+                require(
+                    activeArtifactOnToPlanet.artifactType == ArtifactType.IceLink,
+                    "artifact on toPlanet must be IceLink"
+                );
+
+                require(
+                    artifact.rarity >= activeArtifactOnToPlanet.rarity,
+                    "FireLink rarity must gte IceLink rarity"
+                );
+
+                artifact.linkTo = linkTo;
+
+                shouldDeactivateAndBurn = true;
+
+                // deactivateArtifact(toPlanet.locationId);
+                deactivateArtifactWithoutCheckOwner(toPlanet.locationId);
+            }
+        } else if (artifact.artifactType == ArtifactType.Kardashev) {
+            require(
+                2 * uint256(artifact.rarity) >= planet.planetLevel,
+                "artifact is not powerful enough to apply effect to this planet level"
+            );
+        } else if (artifact.artifactType == ArtifactType.Bomb) {
+            require(
+                2 * uint256(artifact.rarity) >= planet.planetLevel,
+                "artifact is not powerful enough to apply effect to this planet level"
+            );
+
+            // require(linkTo != 0, "you must provide a linkTo to activate a Bomb");
+            // planet.owner = gs().planets[linkTo].owner;
+            // gs().planets[linkTo].owner = msg.sender;
+            // shouldDeactivateAndBurn = true;
+            // } else if (artifact.artifactType == ArtifactType.Doom) {
+            //     // require(linkTo != 0, "you must provide a linkTo to activate a Doom");
+            //     // require(!gs().planets[linkTo].destroyed, "planet destroyed");
+            //     // planet.owner = gs().planets[linkTo].owner;
+            //     // gs().planets[linkTo].owner = msg.sender;
+        } else if (artifact.artifactType == ArtifactType.StellarShield) {
+            // MyTodo: maybe add some limit?
+            require(
+                2 * uint256(artifact.rarity) >= planet.planetLevel,
+                "artifact is not powerful enough to apply effect to this planet level"
+            );
+        } else if (artifact.artifactType == ArtifactType.BlindBox) {
+            // planet.owner = gs().planets[linkTo].owner;
+            // gs().planets[linkTo].owner = msg.sender;
+            // shouldDeactivateAndBurn = true;
+        } else if (artifact.artifactType == ArtifactType.Avatar) {
+            // planet.owner = gs().planets[linkTo].owner;
+            // gs().planets[linkTo].owner = msg.sender;
+            require(planet.hatLevel == 0, "no hat");
+        }
+
+        if (shouldDeactivateAndBurn) {
+            deactivateAndBurn(locationId, artifactId, linkTo, artifact);
+            // artifact.lastDeactivated = block.timestamp; // immediately deactivate
+            // DFArtifactFacet(address(this)).updateArtifact(artifact); // save artifact state immediately, because _takeArtifactOffPlanet will access pull it from tokens contract
+            // emit ArtifactDeactivated(msg.sender, artifactId, locationId, linkTo);
+            // // burn it after use. will be owned by contract but not on a planet anyone can control
+            // LibGameUtils._takeArtifactOffPlanet(artifactId, locationId);
+        } else {
+            DFArtifactFacet(address(this)).updateArtifact(artifact);
+        }
+
+        // this is fine even tho some artifacts are immediately deactivated, because
+        // those artifacts do not buff the planet.
+        LibGameUtils._buffPlanet(locationId, LibGameUtils._getUpgradeForArtifact(artifact));
+    }
+
+    function deactivateAndBurn(
+        uint256 locationId,
+        uint256 artifactId,
+        uint256 linkTo,
+        Artifact memory artifact
+    ) public {
+        artifact.lastDeactivated = block.timestamp; // immediately deactivate
+        DFArtifactFacet(address(this)).updateArtifact(artifact); // save artifact state immediately, because _takeArtifactOffPlanet will access pull it from tokens contract
+        emit ArtifactDeactivated(msg.sender, artifactId, locationId, linkTo);
+        // burn it after use. will be owned by contract but not on a planet anyone can control
+        LibGameUtils._takeArtifactOffPlanet(artifactId, locationId);
+    }
+
+    function deactivateArtifact(uint256 locationId) public {
+        Planet storage planet = gs().planets[locationId];
+
+        require(
+            planet.owner == msg.sender,
+            "you must own the planet you are deactivating an artifact on"
+        );
+
+        require(!planet.destroyed, "planet is destroyed");
+        Artifact memory artifact = LibGameUtils.getActiveArtifact(locationId);
+
+        require(artifact.isInitialized, "this artifact is not activated on this planet");
+
+        if (artifact.artifactType != ArtifactType.IceLink) {
+            require(!planet.frozen, "planet is frozen");
+        } else {
+            Planet storage toPlanet = gs().planets[artifact.linkTo];
+            planet.frozen = false;
+            toPlanet.frozen = false;
+        }
+        artifact.lastDeactivated = block.timestamp;
+        uint256 linkTo = artifact.linkTo;
+        artifact.linkTo = 0;
+
+        emit ArtifactDeactivated(msg.sender, artifact.id, locationId, linkTo);
+        DFArtifactFacet(address(this)).updateArtifact(artifact);
+
+        bool shouldBurn = artifact.artifactType == ArtifactType.PlanetaryShield ||
+            artifact.artifactType == ArtifactType.PhotoidCannon ||
+            artifact.artifactType == ArtifactType.IceLink;
+
+        if (shouldBurn) {
+            // burn it after use. will be owned by contract but not on a planet anyone can control
+            LibGameUtils._takeArtifactOffPlanet(artifact.id, locationId);
+        }
+
+        LibGameUtils._debuffPlanet(locationId, LibGameUtils._getUpgradeForArtifact(artifact));
+    }
+
+    function deactivateArtifactWithoutCheckOwner(uint256 locationId) internal {
+        Planet storage planet = gs().planets[locationId];
+
+        require(!planet.destroyed, "planet is destroyed");
+        Artifact memory artifact = LibGameUtils.getActiveArtifact(locationId);
+
+        require(artifact.isInitialized, "this artifact is not activated on this planet");
+
+        if (artifact.artifactType != ArtifactType.IceLink) {
+            require(!planet.frozen, "planet is frozen");
+        } else {
+            Planet storage toPlanet = gs().planets[artifact.linkTo];
+            planet.frozen = false;
+            toPlanet.frozen = false;
+        }
+        artifact.lastDeactivated = block.timestamp;
+        uint256 linkTo = artifact.linkTo;
+        artifact.linkTo = 0;
+        emit ArtifactDeactivated(msg.sender, artifact.id, locationId, linkTo);
+        DFArtifactFacet(address(this)).updateArtifact(artifact);
+
+        bool shouldBurn = artifact.artifactType == ArtifactType.PlanetaryShield ||
+            artifact.artifactType == ArtifactType.PhotoidCannon ||
+            artifact.artifactType == ArtifactType.IceLink ||
+            artifact.artifactType == ArtifactType.StellarShield;
+
+        if (shouldBurn) {
+            // burn it after use. will be owned by contract but not on a planet anyone can control
+            LibGameUtils._takeArtifactOffPlanet(artifact.id, locationId);
+        }
+
+        LibGameUtils._debuffPlanet(locationId, LibGameUtils._getUpgradeForArtifact(artifact));
+    }
+
+    function depositArtifact(
+        uint256 locationId,
+        uint256 artifactId,
+        address coreAddress
+    ) public {
+        Planet storage planet = gs().planets[locationId];
+
+        require(!gs().planets[locationId].destroyed, "planet is destroyed");
+        require(!gs().planets[locationId].frozen, "planet is frozen");
+
+        require(planet.planetType == PlanetType.TRADING_POST, "can only deposit on trading posts");
+        require(
+            DFArtifactFacet(address(this)).ownerOf(artifactId) == msg.sender,
+            "you can only deposit artifacts you own"
+        );
+        require(planet.owner == msg.sender, "you can only deposit on a planet you own");
+
+        Artifact memory artifact = DFArtifactFacet(address(this)).getArtifact(artifactId);
+        require(
+            planet.planetLevel > uint256(artifact.rarity),
+            "spacetime rip not high enough level to deposit this artifact"
+        );
+        require(!isSpaceship(artifact.artifactType), "cannot deposit spaceships");
+
+        require(
+            gs().planetArtifacts[locationId].length < gameConstants().MAX_ARTIFACT_PER_PLANET,
+            "too many artifacts on this planet"
+        );
+
+        LibGameUtils._putArtifactOnPlanet(artifactId, locationId);
+
+        DFArtifactFacet(address(this)).transferArtifact(artifactId, coreAddress);
+    }
+
+    function withdrawArtifact(uint256 locationId, uint256 artifactId) public {
+        Planet storage planet = gs().planets[locationId];
+
+        require(
+            planet.planetType == PlanetType.TRADING_POST,
+            "can only withdraw from trading posts"
+        );
+        require(!gs().planets[locationId].destroyed, "planet is destroyed");
+        require(!gs().planets[locationId].frozen, "planet is frozen");
+
+        require(planet.owner == msg.sender, "you can only withdraw from a planet you own");
+        Artifact memory artifact = LibGameUtils.getPlanetArtifact(locationId, artifactId);
+        require(artifact.isInitialized, "this artifact is not on this planet");
+
+        require(
+            planet.planetLevel > uint256(artifact.rarity),
+            "spacetime rip not high enough level to withdraw this artifact"
+        );
+        require(!isSpaceship(artifact.artifactType), "cannot withdraw spaceships");
+
+        // NOTE: round 4 can withdraw Avatar artifact
+        // require(artifact.artifactType != ArtifactType.Avatar, "cannot withdraw avatar artifact");
+
+        LibGameUtils._takeArtifactOffPlanet(artifactId, locationId);
+
+        DFArtifactFacet(address(this)).transferArtifact(artifactId, msg.sender);
+    }
+
+    function prospectPlanet(uint256 locationId) public {
+        Planet storage planet = gs().planets[locationId];
+
+        require(!planet.destroyed, "planet is destroyed");
+        require(!planet.frozen, "planet is frozen");
+
+        require(planet.planetType == PlanetType.RUINS, "you can't find an artifact on this planet");
+        require(planet.owner == msg.sender, "you must own this planet");
+        require(planet.prospectedBlockNumber == 0, "this planet has already been prospected");
+
+        if (gameConstants().SPACESHIPS.GEAR) {
+            require(containsGear(locationId), "gear ship must be present on planet");
+        } else {
+            require(
+                planet.population * 100 >= planet.populationCap * 78,
+                // We lie here, but it is a better UX
+                "planet must have 80% energy before capturing"
+            );
+        }
+
+        planet.prospectedBlockNumber = block.number;
+    }
+
+    function containsGear(uint256 locationId) public view returns (bool) {
+        uint256[] memory artifactIds = gs().planetArtifacts[locationId];
+
+        for (uint256 i = 0; i < artifactIds.length; i++) {
+            Artifact memory artifact = DFArtifactFacet(address(this)).getArtifact(artifactIds[i]);
+            if (
+                artifact.artifactType == ArtifactType.ShipGear && msg.sender == artifact.controller
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function isSpaceship(ArtifactType artifactType) public pure returns (bool) {
+        return artifactType >= ArtifactType.ShipMothership && artifactType <= ArtifactType.ShipPink;
+    }
+
+    function _randomBuyArtifactTypeAndRarity(uint256 artifactSeed)
+        internal
+        pure
+        returns (
+            Biome,
+            ArtifactType,
+            ArtifactRarity
+        )
+    {
+        uint256 lastByteOfSeed = artifactSeed % 10000;
+        uint256 secondLastByteOfSeed = ((artifactSeed - lastByteOfSeed) / 10000) % 10;
+
+        Biome biome = Biome.Ocean;
+        ArtifactType artifactType = ArtifactType.Wormhole;
+        ArtifactRarity rarity = ArtifactRarity.Common;
+
+        if (secondLastByteOfSeed == 0) {
+            biome = Biome.Ocean;
+        } else if (secondLastByteOfSeed == 1) {
+            biome = Biome.Forest;
+        } else if (secondLastByteOfSeed == 2) {
+            biome = Biome.Grassland;
+        } else if (secondLastByteOfSeed == 3) {
+            biome = Biome.Tundra;
+        } else if (secondLastByteOfSeed == 4) {
+            biome = Biome.Swamp;
+        } else if (secondLastByteOfSeed == 5) {
+            biome = Biome.Desert;
+        } else if (secondLastByteOfSeed == 6) {
+            biome = Biome.Ice;
+        } else if (secondLastByteOfSeed == 7) {
+            biome = Biome.Wasteland;
+        } else if (secondLastByteOfSeed == 8) {
+            biome = Biome.Lava;
+        } else {
+            biome = Biome.Corrupted;
+        }
+
+        if (lastByteOfSeed < 1400) {
+            rarity = ArtifactRarity.Common;
+            artifactType = ArtifactType.Wormhole;
+        } else if (lastByteOfSeed < 1750) {
+            rarity = ArtifactRarity.Rare;
+            artifactType = ArtifactType.Wormhole;
+        } else if (lastByteOfSeed < 1964) {
+            rarity = ArtifactRarity.Epic;
+            artifactType = ArtifactType.Wormhole;
+        } else if (lastByteOfSeed < 2016) {
+            rarity = ArtifactRarity.Legendary;
+            artifactType = ArtifactType.Wormhole;
+        } else if (lastByteOfSeed < 2033) {
+            rarity = ArtifactRarity.Mythic;
+            artifactType = ArtifactType.Wormhole;
+        } else if (lastByteOfSeed < 3373) {
+            rarity = ArtifactRarity.Common;
+            artifactType = ArtifactType.PlanetaryShield;
+        } else if (lastByteOfSeed < 3716) {
+            rarity = ArtifactRarity.Rare;
+            artifactType = ArtifactType.PlanetaryShield;
+        } else if (lastByteOfSeed < 3930) {
+            rarity = ArtifactRarity.Epic;
+            artifactType = ArtifactType.PlanetaryShield;
+        } else if (lastByteOfSeed < 3983) {
+            rarity = ArtifactRarity.Legendary;
+            artifactType = ArtifactType.PlanetaryShield;
+        } else if (lastByteOfSeed < 4000) {
+            rarity = ArtifactRarity.Mythic;
+            artifactType = ArtifactType.PlanetaryShield;
+        } else if (lastByteOfSeed < 5000) {
+            rarity = ArtifactRarity.Common;
+            artifactType = ArtifactType.PhotoidCannon;
+        } else if (lastByteOfSeed < 5550) {
+            rarity = ArtifactRarity.Rare;
+            artifactType = ArtifactType.PhotoidCannon;
+        } else if (lastByteOfSeed < 5800) {
+            rarity = ArtifactRarity.Epic;
+            artifactType = ArtifactType.PhotoidCannon;
+        } else if (lastByteOfSeed < 5950) {
+            rarity = ArtifactRarity.Legendary;
+            artifactType = ArtifactType.PhotoidCannon;
+        } else if (lastByteOfSeed < 6000) {
+            rarity = ArtifactRarity.Mythic;
+            artifactType = ArtifactType.PhotoidCannon;
+        } else if (lastByteOfSeed < 6700) {
+            rarity = ArtifactRarity.Common;
+            artifactType = ArtifactType.BloomFilter;
+        } else if (lastByteOfSeed < 6860) {
+            rarity = ArtifactRarity.Rare;
+            artifactType = ArtifactType.BloomFilter;
+        } else if (lastByteOfSeed < 6970) {
+            rarity = ArtifactRarity.Epic;
+            artifactType = ArtifactType.BloomFilter;
+        } else if (lastByteOfSeed < 6995) {
+            rarity = ArtifactRarity.Legendary;
+            artifactType = ArtifactType.BloomFilter;
+        } else if (lastByteOfSeed < 7000) {
+            rarity = ArtifactRarity.Mythic;
+            artifactType = ArtifactType.BloomFilter;
+        } else if (lastByteOfSeed < 7700) {
+            rarity = ArtifactRarity.Common;
+            artifactType = ArtifactType.BlackDomain;
+        } else if (lastByteOfSeed < 7860) {
+            rarity = ArtifactRarity.Rare;
+            artifactType = ArtifactType.BlackDomain;
+        } else if (lastByteOfSeed < 7970) {
+            rarity = ArtifactRarity.Epic;
+            artifactType = ArtifactType.BlackDomain;
+        } else if (lastByteOfSeed < 7995) {
+            rarity = ArtifactRarity.Legendary;
+            artifactType = ArtifactType.BlackDomain;
+        } else if (lastByteOfSeed < 8000) {
+            rarity = ArtifactRarity.Mythic;
+            artifactType = ArtifactType.BlackDomain;
+        } else if (lastByteOfSeed < 9000) {
+            rarity = ArtifactRarity.Common;
+            artifactType = ArtifactType.StellarShield;
+        } else if (lastByteOfSeed < 9550) {
+            rarity = ArtifactRarity.Rare;
+            artifactType = ArtifactType.StellarShield;
+        } else if (lastByteOfSeed < 9800) {
+            rarity = ArtifactRarity.Epic;
+            artifactType = ArtifactType.StellarShield;
+        } else if (lastByteOfSeed < 9950) {
+            rarity = ArtifactRarity.Legendary;
+            artifactType = ArtifactType.StellarShield;
+        } else {
+            rarity = ArtifactRarity.Mythic;
+            artifactType = ArtifactType.StellarShield;
+        }
+        return (biome, artifactType, rarity);
+    }
+}

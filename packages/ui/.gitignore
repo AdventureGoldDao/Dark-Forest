@@ -1,0 +1,8 @@
+tsconfig.ref.tsbuildinfo
+yarn-error.log
+yarn.lock
+package-lock.json
+dist
+interfaces
+classes
+README.md
