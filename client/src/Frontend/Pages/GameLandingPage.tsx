@@ -292,7 +292,7 @@ export function GameLandingPage({ match, location }: RouteComponentProps<{ contr
           terminal.current?.print(`(${i + 1}): ${accounts[i].address}  `, TerminalTextStyle.Sub);
           if (balance < 0.0001) {
             terminal.current?.print(balance.toFixed(9) + ' ' + TOKEN_NAME, TerminalTextStyle.Red);
-            terminal.current?.println(' => select this account to know how to get enough ETH');
+            terminal.current?.println(' => select this account to know how to get enough AGLD');
           } else {
             terminal.current?.println(
               balance.toFixed(9) + ' ' + TOKEN_NAME,
@@ -480,6 +480,7 @@ export function GameLandingPage({ match, location }: RouteComponentProps<{ contr
         const balance = weiToEth(await ethConnection.loadBalance(playerAddress));
 
         if (balance < 0.0001) {
+          terminal.current?.println(`        Network: Adventure Layer`);
           terminal.current?.print(`   Your account: `);
           terminal.current?.println(`${playerAddress}`, TerminalTextStyle.Green);
 
@@ -498,18 +499,18 @@ export function GameLandingPage({ match, location }: RouteComponentProps<{ contr
           terminal.current?.println('');
 
           terminal.current?.print(`   Your balance: `);
-          terminal.current?.print(`${balance.toFixed(9)} ${TOKEN_NAME}`, TerminalTextStyle.Red);
+          terminal.current?.print(`${balance.toFixed(2)} ${TOKEN_NAME}`, TerminalTextStyle.Red);
 
-          terminal.current?.println(' <= recommend depositing 0.003 ETH');
+          terminal.current?.println(' <= recommend deposition 1 AGLD');
 
           terminal.current?.print(`           NOTE: `, TerminalTextStyle.Pink);
 
           terminal.current?.println(
-            'You can use bridge to transfer ETH to Redstone Mainnet',
+            'You can use bridge to transfer AGLD to Adventure Layer',
             TerminalTextStyle.Pink
           );
 
-          terminal.current?.print('   L2-L2 bridge: ');
+          terminal.current?.print('         Bridge: ');
 
           terminal.current?.printLink(
             BLOCKCHAIN_BRIDGE,
@@ -519,26 +520,26 @@ export function GameLandingPage({ match, location }: RouteComponentProps<{ contr
             TerminalTextStyle.Green
           );
 
-          terminal.current?.println(' <= transfer ETH from L2 (e.g. optimism) to Redstone Mainnet');
+          terminal.current?.println(' <= transfer AGLD frome Ethereum to Adventure Layer');
 
           terminal.current?.print('   Player guide: ');
 
-          terminal.current?.printLink(
-            'How to get ETH on the Redstone mainnet for your account',
-            () => {
-              window.open(HOW_TO_TRANSFER_ETH_FROM_L2_TO_REDSTONE);
-            },
-            TerminalTextStyle.Green
-          );
-          terminal.current?.println(
-            ' <= New player please check this guide !!!',
-            TerminalTextStyle.Pink
-          );
+          // terminal.current?.printLink(
+          //   'How to get ETH on the Redstone mainnet for your account',
+          //   () => {
+          //     window.open(HOW_TO_TRANSFER_ETH_FROM_L2_TO_REDSTONE);
+          //   },
+          //   TerminalTextStyle.Green
+          // );
+          // terminal.current?.println(
+          //   ' <= New player please check this guide !!!',
+          //   TerminalTextStyle.Pink
+          // );
 
           terminal.current?.println('');
 
           terminal.current?.println(
-            'After your account get ETH on Redstone Mainet, press [enter] to continue.',
+            'After your account get AGLD on Adventure Layer, please ensure that there is at least one 1 AGLD in the address, press [enter] to continue.',
             TerminalTextStyle.Pink
           );
 

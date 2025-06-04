@@ -161,7 +161,7 @@ export const BLOCK_EXPLORER_URL = 'https://explorer-devnet.adventurelayer.xyz' a
  * The URL to the bridge for the chain being used. Prepended to transaction links, etc
  */
 
-export const BLOCKCHAIN_BRIDGE = 'https://relay.link/bridge/redstone/' as const;
+export const BLOCKCHAIN_BRIDGE = 'https://bridge-mainnet.adventurelayer.xyz/' as const;
 /**
  * The amount of time between gas price refreshes when fetching prices from the oracle.
  */
@@ -237,7 +237,7 @@ export const THEGRAPH_API_URL =
   'https://api.thegraph.com/subgraphs/name/darkforest-eth/dark-forest-v06-round-5';
 
 export const PLAYER_GUIDE =
-  'https://dfares.notion.site/DFAres-Round-4-Guide-c52181824f21461f9fa50a9f7989555c?pvs=74';
+  'https://www.youtube.com/watch?v=j0XJ1byoi_I';
 
 export const HOW_TO_TRANSFER_ETH_FROM_L2_TO_REDSTONE =
   'https://dfares.notion.site/How-to-transfer-ETH-from-L2-to-Redstone-Mainnet-f0be2d7a3d274e8a88f8e83d0ef4e212?pvs=74';
