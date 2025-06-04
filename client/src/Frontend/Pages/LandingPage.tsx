@@ -26,14 +26,14 @@ const DFOfficeLinks = {
 };
 
 const DFArchonLinks = {
-  twitter: 'https://twitter.com/DFArchon',
+  twitter: 'https://x.com/AdventureLayer',
   email: 'mailto:dfarchon@gmail.com',
   blog: 'https://mirror.xyz/dfarchon.eth',
-  discord: 'https://discord.com/invite/XpBPEnsvgX',
+  discord: 'https://discord.com/invite/aJxvgkjCxD',
   github: 'https://github.com/dfarchon',
   wiki: 'https://dfwiki.net/wiki/Main_Page',
   plugins: 'https://dfares-plugins.netlify.app/',
-  guide: PLAYER_GUIDE,
+  guide: 'https://docs.adventurelayer.xyz/pages/chain/ChainInfo',
 };
 
 const defaultAddress = address(CONTRACT_ADDRESS);
